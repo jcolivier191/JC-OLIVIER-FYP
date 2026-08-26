@@ -130,4 +130,14 @@ def predict_test_set(result, run_name=""):
         preds = result["trainer"].predict(result["mpnn"], result["test_loader"])                #USES THE TEST DATA, THE BEST WEIGHTED NEURAL NETWORK, AND THE TRAINER TO MAKE PREDICTIONS
     y_pred = torch.cat([p if torch.is_tensor(p) else p[0] for p in preds]).numpy().flatten()    #PREDICTION DATA FORMATING FOR NUMPY MANIPULATION
     y_true = np.array([dp.y for dp in result["test_dset"].data]).flatten()
-    return pd.DataFrame({"run_name": run_name, "y_true": y_true, "y_pred": y_pred})             #RETURNS PREDUCTIONS AND TRUE VALUES IN A DATAFRAME FOR LATER DISPLAY
+
+    abs_error = np.abs(y_pred - y_true)                                                         #RELATIVE ERROR METRIC ADDED
+    rel_error = abs_error/ np.abs(y_true)*100  
+    
+    return pd.DataFrame({
+    "run_name": run_name,
+    "y_true": y_true,
+    "y_pred": y_pred,
+    "abs_error": abs_error,
+    "rel_error_pct": rel_error,
+})                                                   #RETURNS PREDUCTIONS AND TRUE VALUES IN A DATAFRAME FOR LATER DISPLAY
