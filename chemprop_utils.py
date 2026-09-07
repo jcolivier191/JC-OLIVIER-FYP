@@ -8,6 +8,7 @@ import pandas as pd                                                        #LIBR
 from lightning import pytorch as pl                                        #LIBRARY FOR NN ITERATIVE CALCULATIONS
 from lightning.pytorch.callbacks import ModelCheckpoint, EarlyStopping     #LIBRARY FOR TRAINING LOSS EVALAUTION AND STOPPING CRITERIA
 from chemprop import data, featurizers, models, nn                         #LIBRARY FOR CHEMPROP ITSELF
+from rdkit import Chem                                                     #LIBRARY FOR CHEMICAL STRUCTURE MANIPULATION       
 
 num_workers = 0                                                            #THE NUMBER OF WORKERS USED FOR DATA LOADING AS A BACKGROUD PROCESS. INCREASING WORKER NUMBER CAN INCREASE PROCESSING SPEED, BUT MAY BE UNSTABLE IN SOME INSTANCES. GIVEN THE SMALL SIZE OF TEH DATASET, ZERO WORKERS IS MOST APPROPRIATE.
                                                                             
@@ -16,17 +17,35 @@ num_workers = 0                                                            #THE 
 #DF IS A CLEANED PANDAS DATAFRAME WITH THE SAME STRCUTURE AS THE RAW DATAFRAME, BUT WITH EMPTY ROWS REMOVED.
 # ALL_DATA IS A "TRAINING READY" LIST OF CHEMPROP MOLECULEDATAPOINTS. IT ONLY CONTAINS SMILES AND PAIRED TARGET PROPERTY VALUES.
 # MOLS IS A LIST OF RDKIT MOLECULE OBJECTS OBTAINED FROM SMILES. IT IS USED FOR DATA SPLITTING.                                                                
-def load_and_clean_data(input_path, smiles_column, target_columns):                                         #DEFINES A FUNCTION OF THE THREE INPUTS DESCRIBED ABOVE
-    df = pd.read_csv(input_path)                                                                            #READS THE .CSV FILE INTO A PANDAS DATAFRAME FROM THE INPUT PATH SPECIFIED
-    n_before = len(df)                                                                                      #INDENTIFIES THE NUMBER OF ROWS IN THE RAW DATAFRAME
-    df = df.dropna(subset=target_columns).reset_index(drop=True)                                            #SCANS FOR EMPTY ENTRIES IN THE TARGET PROPERTY COLUMN AND REMOVES THE CORRESPONDING ROW BEFORE REORDERING TO REMOVE THE GAPS FORMED
-    print(f"Loaded {n_before} rows, dropped {n_before - len(df)} with missing target, {len(df)} remain")    #DISPLAYS THE NUMBER OF INITIAL ROWS, THE NUMBER REMOVED AND THE NEW NUMBER FOR VERIFCATION PURPOSES
+def load_and_clean_data(input_path, smiles_column, target_columns):
+    df = pd.read_csv(input_path)
+    n_before = len(df)
+    df = df.dropna(subset=target_columns + [smiles_column]).reset_index(drop=True)
 
-    smis = df.loc[:, smiles_column].values                                                                  #EXACTS ALL SMILES AND SAVES THEM AS A NUMPY ARRAY
-    ys = df.loc[:, target_columns].values                                                                   #EXTRACTS ALL TARGET PROPERTY VALYES AND SAVES THEM AS A NUMPY ARRAY
-    all_data = [data.MoleculeDatapoint.from_smi(smi, y) for smi, y in zip(smis, ys)]                        #PAIRS EXTRACTED SMILES TO THEIR CORRESPONDING TARGET PROPERTY VALUES AND SAVES THEM AS A LIST OF CHEMPROP MOLECULEDATAPOINTS
-    mols = [d.mol for d in all_data]                                                                        #MODIFES THE CHEMPROP MOLECULEDATAPOINT STRUCTURE FOR USE BY RDKIT LIBRARIES
-    return df, all_data, mols                                                                               #RETUNRS THE NEW CLEANED DATAFRAME, AS WELL AS CHEMPROP MOLECULEDATAPOINT AND RDKIT STRUCTURES
+    def sanitize_smiles(smi):
+        mol = Chem.MolFromSmiles(smi)
+        if mol is None:
+            return None
+        try:
+            Chem.RemoveStereochemistry(mol)   #STRIPS ALL STEREO BOND/ATOM FLAGS — PREVENTS RDKIT CRASHES DURING LATER SCAFFOLD CANONICALIZATION ON CORRUPTED STEREO DATA
+            return Chem.MolToSmiles(mol)       #RE-CANONICALIZES THE NOW STEREO-FREE MOLECULE BACK TO A CLEAN SMILES STRING
+        except Exception:
+            return None
+
+    df[smiles_column] = df[smiles_column].apply(sanitize_smiles)
+    n_failed = df[smiles_column].isna().sum()
+    if n_failed > 0:
+        print(f"Dropping {n_failed} rows with unparseable/unsanitizable SMILES")
+    df = df.dropna(subset=[smiles_column]).reset_index(drop=True)
+
+    print(f"Loaded {n_before} rows, dropped {n_before - len(df)} with missing/invalid target, smiles, or stereo issues, {len(df)} remain")
+
+    smis = df.loc[:, smiles_column].values
+    ys = df.loc[:, target_columns].values
+    all_data = [data.MoleculeDatapoint.from_smi(smi, y) for smi, y in zip(smis, ys)]
+    mols = [d.mol for d in all_data]
+    return df, all_data, mols
+
 
 
 
@@ -71,6 +90,13 @@ def build_and_train_mpnn(train_data, val_data, test_data, metric_list=None, max_
 
     train_dset = data.MoleculeDataset(train_data[0], featurizer)                                #CREATES A STRUCTURE THAT COMBINES THE FEATURIZER AND THE TRAINING DATA ITSELF SO THAT TENSORS CAN BE GENERATED FOR EACH MOLECULE IN THE DATASET
     scaler = train_dset.normalize_targets()                                                     #NORMALIZATION OF TARGET PROPERTY VALUES TO A MEAN OF 0 AND STANDARD DEVIATION OF 1. 
+
+    #NOTE: A SEPARATE, UNSCALED COPY OF THE TRAIN DATA IS BUILT HERE SPECIFICALLY FOR LATER EVALUATION —
+    #TRAIN_DSET ITSELF STAYS SCALED (REQUIRED FOR TRAINING), SO REUSING IT DIRECTLY FOR PREDICTION COMPARISON
+    #WOULD REPEAT THE SAME UNIT-MISMATCH BUG THAT WAS FIXED FOR THE TEST SET EARLIER
+    train_eval_dset = data.MoleculeDataset(train_data[0], featurizer)
+    train_eval_loader = data.build_dataloader(train_eval_dset, num_workers=num_workers, shuffle=False)
+
     #NOTE: THIS IS DONE TO IMPROVE TRAINING STABILITY. THE RAW TARGET PROPERTY VALUES ARE TYPICALLY MUCH LARGER THAN THE INITIAL NEURAL NETWORK WEIGHTS, RESULTING IN UNSTABLE AND OFTEN SLOW TRAINING. 
     #THE MODEL OUTPUT IS UNSCALED DURING PREDICTION
     val_dset = data.MoleculeDataset(val_data[0], featurizer)                                    #THE VALIDATION DATA IS SIMULARLY WRAPPED WITH THE FEATURIZER AND NORMALIZED USING THE SAME SCALER AS THE TRAINING DATA
@@ -118,26 +144,29 @@ def build_and_train_mpnn(train_data, val_data, test_data, metric_list=None, max_
 
     test_results = trainer.test(mpnn, test_loader)                                              #MODEL TESTING BASED ON THE TEST DATA AND BEST WEIGHT BASED NEURAL NETWORK
 
-    return {                                                                                    #RETURNS ALL OUTOPUTS TO CALLER FUNCTION
-        "mpnn": mpnn, "trainer": trainer, "scaler": scaler,
-        "test_results": test_results, "test_dset": test_dset, "test_loader": test_loader,
-        "best_ckpt_path": best_ckpt_path,
-    }
+    return {
+    "mpnn": mpnn, "trainer": trainer, "scaler": scaler,
+    "test_results": test_results, "test_dset": test_dset, "test_loader": test_loader,
+    "train_dset": train_eval_dset, "train_loader": train_eval_loader,
+    "best_ckpt_path": best_ckpt_path,
+}
 
 #FUNCTION FOR PREDICTION BASED ON BEST WEIGHTED NEURAL NETWORK
-def predict_test_set(result, run_name=""):
-    with torch.inference_mode():                                                                #SPECIFIES THAT GRADIENT TRACKING IS UNECESSARY FOR PREDICTION
-        preds = result["trainer"].predict(result["mpnn"], result["test_loader"])                #USES THE TEST DATA, THE BEST WEIGHTED NEURAL NETWORK, AND THE TRAINER TO MAKE PREDICTIONS
-    y_pred = torch.cat([p if torch.is_tensor(p) else p[0] for p in preds]).numpy().flatten()    #PREDICTION DATA FORMATING FOR NUMPY MANIPULATION
-    y_true = np.array([dp.y for dp in result["test_dset"].data]).flatten()
+def predict_on_set(result, dset_key, loader_key, run_name=""):    #GENERALIZED VERSION OF PREDICTION FUNCTION THAT WORKS ON ANY SPLIT (TRAIN, VAL, TEST)
+    with torch.inference_mode():
+        preds = result["trainer"].predict(result["mpnn"], result[loader_key])
+    y_pred = torch.cat([p if torch.is_tensor(p) else p[0] for p in preds]).numpy().flatten()
+    y_true = np.array([dp.y for dp in result[dset_key].data]).flatten()
+    smiles = [Chem.MolToSmiles(dp.mol) for dp in result[dset_key].data]
 
-    abs_error = np.abs(y_pred - y_true)                                                         #RELATIVE ERROR METRIC ADDED
-    rel_error = abs_error/ np.abs(y_true)*100  
-    
+    abs_error = np.abs(y_pred - y_true)
+    rel_error = abs_error / np.abs(y_true) * 100
+
     return pd.DataFrame({
-    "run_name": run_name,
-    "y_true": y_true,
-    "y_pred": y_pred,
-    "abs_error": abs_error,
-    "rel_error_pct": rel_error,
-})                                                   #RETURNS PREDUCTIONS AND TRUE VALUES IN A DATAFRAME FOR LATER DISPLAY
+        "run_name": run_name, "smiles": smiles, "y_true": y_true, "y_pred": y_pred,
+        "abs_error": abs_error, "rel_error_pct": rel_error,
+    })
+
+
+def predict_test_set(result, run_name=""):    #KEPT FOR BACKWARD COMPATIBILITY — THIN WRAPPER AROUND predict_on_set
+    return predict_on_set(result, "test_dset", "test_loader", run_name)                                                #RETURNS PREDICTIONS, PAIRED MOLECULES (SMILES) AND TRUE VALUES IN A DATAFRAME FOR LATER DISPLAY
