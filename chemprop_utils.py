@@ -8,7 +8,8 @@ import pandas as pd                                                        #LIBR
 from lightning import pytorch as pl                                        #LIBRARY FOR NN ITERATIVE CALCULATIONS
 from lightning.pytorch.callbacks import ModelCheckpoint, EarlyStopping     #LIBRARY FOR TRAINING LOSS EVALAUTION AND STOPPING CRITERIA
 from chemprop import data, featurizers, models, nn                         #LIBRARY FOR CHEMPROP ITSELF
-from rdkit import Chem                                                     #LIBRARY FOR CHEMICAL STRUCTURE MANIPULATION       
+from rdkit import Chem                                                     #LIBRARY FOR CHEMICAL STRUCTURE MANIPULATION 
+from thermo.group_contribution import Joback      
 
 num_workers = 0                                                            #THE NUMBER OF WORKERS USED FOR DATA LOADING AS A BACKGROUD PROCESS. INCREASING WORKER NUMBER CAN INCREASE PROCESSING SPEED, BUT MAY BE UNSTABLE IN SOME INSTANCES. GIVEN THE SMALL SIZE OF TEH DATASET, ZERO WORKERS IS MOST APPROPRIATE.
                                                                             
@@ -20,6 +21,29 @@ num_workers = 0                                                            #THE 
 def load_and_clean_data(input_path, smiles_column, target_columns):
     df = pd.read_csv(input_path)
     n_before = len(df)
+    #HANDLE TARGET VALUES STORED AS COMMA-SEPARATED STRINGS (E.G. "396.15, 396.15, 396.15, 396.15") —
+    #SOME ROWS APPEAR TO CONTAIN MULTIPLE REPEATED/DUPLICATE MEASUREMENTS AS A SINGLE STRING RATHER THAN
+    #A SINGLE CONSENSUS VALUE. TAKES THE MEAN OF ALL COMMA-SEPARATED VALUES IN SUCH CASES.
+    def parse_target(val):
+        if pd.isna(val):
+            return np.nan
+        if isinstance(val, str) and "," in val:
+            try:
+                parts = [float(v.strip()) for v in val.split(",")]
+                return sum(parts) / len(parts)
+            except ValueError:
+                return np.nan
+        try:
+            return float(val)
+        except (ValueError, TypeError):
+            return np.nan
+
+    for col in target_columns:
+        n_multi_value = df[col].apply(lambda v: isinstance(v, str) and "," in v).sum()
+        if n_multi_value > 0:
+            print(f"Found {n_multi_value} rows in '{col}' with comma-separated multi-value strings — averaging them")
+        df[col] = df[col].apply(parse_target)
+
     df = df.dropna(subset=target_columns + [smiles_column]).reset_index(drop=True)
 
     def sanitize_smiles(smi):
@@ -169,4 +193,242 @@ def predict_on_set(result, dset_key, loader_key, run_name=""):    #GENERALIZED V
 
 
 def predict_test_set(result, run_name=""):    #KEPT FOR BACKWARD COMPATIBILITY — THIN WRAPPER AROUND predict_on_set
-    return predict_on_set(result, "test_dset", "test_loader", run_name)                                                #RETURNS PREDICTIONS, PAIRED MOLECULES (SMILES) AND TRUE VALUES IN A DATAFRAME FOR LATER DISPLAY
+    return predict_on_set(result, "test_dset", "test_loader", run_name)     #RETURNS PREDICTIONS, PAIRED MOLECULES (SMILES) AND TRUE VALUES IN A DATAFRAME FOR LATER DISPLAY
+
+
+
+#MULTI-TASK TRAINING FUNCTION. THIS IS A MODIFIED VERSION OF THE SINGLE-TASK TRAINING FUNCTION ABOVE, BUT WITH MULTI-TASK CAPABILITIES. IT TAKES A LIST OF TASK NAMES AS INPUT AND BUILDS A MULTI-TASK NEURAL NETWORK WITH ONE OUTPUT HEAD PER TASK.
+def build_and_train_multitask_mpnn(train_data, val_data, test_data, task_names, metric_list=None,
+                                    max_epochs=50, run_name="run", dropout=0.0, checkpoint_root="checkpoints"):
+    #MULTI-TASK VERSION OF build_and_train_mpnn — TRAINS ONE MODEL TO JOINTLY PREDICT MULTIPLE PROPERTIES
+    #(HERE: Tm AND dHfus) FROM A SHARED MOLECULAR REPRESENTATION, RATHER THAN ONE MODEL PER PROPERTY
+    n_tasks = len(task_names)
+    featurizer = featurizers.SimpleMoleculeMolGraphFeaturizer()
+
+    train_dset = data.MoleculeDataset(train_data[0], featurizer)
+    scaler = train_dset.normalize_targets()      #SCALES EACH TASK INDEPENDENTLY (PER-COLUMN MEAN/STD)
+
+    val_dset = data.MoleculeDataset(val_data[0], featurizer)
+    val_dset.normalize_targets(scaler)
+
+    test_dset = data.MoleculeDataset(test_data[0], featurizer)   #LEFT UNSCALED — SAME REASONING AS SINGLE-TASK VERSION
+
+    train_loader = data.build_dataloader(train_dset, num_workers=num_workers)
+    val_loader = data.build_dataloader(val_dset, num_workers=num_workers, shuffle=False)
+    test_loader = data.build_dataloader(test_dset, num_workers=num_workers, shuffle=False)
+
+    mp = nn.BondMessagePassing(dropout=dropout)
+    agg = nn.MeanAggregation()
+    output_transform = nn.UnscaleTransform.from_standard_scaler(scaler)
+    ffn = nn.RegressionFFN(n_tasks=n_tasks, output_transform=output_transform, dropout=dropout)   #n_tasks=2 IS THE KEY CHANGE — ONE OUTPUT HEAD PER PROPERTY
+    if metric_list is None:
+        metric_list = [nn.metrics.RMSE(), nn.metrics.MAE()]
+    mpnn = models.MPNN(mp, agg, ffn, True, metric_list)
+
+    early_stopping = EarlyStopping(monitor="val_loss", mode="min", patience=10)
+    checkpointing = ModelCheckpoint(
+        dirpath=f"{checkpoint_root}/{run_name}", filename="best-{epoch}-{val_loss:.3f}",
+        monitor="val_loss", mode="min", save_top_k=1,
+    )
+    trainer = pl.Trainer(max_epochs=max_epochs, callbacks=[checkpointing, early_stopping],
+                          enable_progress_bar=True, accelerator="auto", devices=1)
+    trainer.fit(mpnn, train_loader, val_loader)
+
+    best_ckpt_path = checkpointing.best_model_path
+    checkpoint = torch.load(best_ckpt_path, weights_only=False, map_location="cpu")
+    mpnn.load_state_dict(checkpoint["state_dict"])
+
+    test_results = trainer.test(mpnn, test_loader)
+
+    train_eval_dset = data.MoleculeDataset(train_data[0], featurizer)
+    train_eval_loader = data.build_dataloader(train_eval_dset, num_workers=num_workers, shuffle=False)
+
+    return {
+        "mpnn": mpnn, "trainer": trainer, "scaler": scaler, "task_names": task_names,
+        "test_results": test_results, "test_dset": test_dset, "test_loader": test_loader,
+        "train_dset": train_eval_dset, "train_loader": train_eval_loader,
+        "best_ckpt_path": best_ckpt_path,
+    }
+
+
+def predict_multitask(result, run_name=""):
+    #RETURNS PER-TASK PREDICTIONS FROM A MULTI-TASK MODEL, AS A DICT OF DATAFRAMES KEYED BY TASK NAME
+    with torch.inference_mode():
+        preds = result["trainer"].predict(result["mpnn"], result["test_loader"])
+    y_pred_all = torch.cat([p if torch.is_tensor(p) else p[0] for p in preds]).numpy()   #SHAPE (n, n_tasks)
+    y_true_all = np.array([dp.y for dp in result["test_dset"].data])                     #SHAPE (n, n_tasks)
+    smiles = [Chem.MolToSmiles(dp.mol) for dp in result["test_dset"].data]
+
+    task_dfs = {}
+    for i, task_name in enumerate(result["task_names"]):
+        y_pred = y_pred_all[:, i]
+        y_true = y_true_all[:, i]
+        abs_error = np.abs(y_pred - y_true)
+        rel_error = abs_error / np.abs(y_true) * 100
+        task_dfs[task_name] = pd.DataFrame({
+            "run_name": run_name, "smiles": smiles, "y_true": y_true, "y_pred": y_pred,
+            "abs_error": abs_error, "rel_error_pct": rel_error,
+        })
+    return task_dfs
+
+
+#THIS FUNCTION POOLS TM AND HFUS DATA INTO A SINGLE DATASET BUT WITHOUT DROPPING MISSING VALUES FOR A LARGER POOLED DATA SET COMPARED TO THE STRICT MATCHED DATASET
+def load_and_pool_multitask_data(dhfus_path, tm_path, smiles_column,
+                                  dhfus_target_col, tm_target_col,
+                                  tm_sample_size=10000, seed=0):
+    
+    df_dhfus = pd.read_csv(dhfus_path)[[smiles_column, dhfus_target_col]].rename(columns={dhfus_target_col: "dHfus"})
+    df_tm = pd.read_csv(tm_path)[[smiles_column, tm_target_col]].rename(columns={tm_target_col: "Tm"})
+
+    def parse_target(val):
+        if pd.isna(val):
+            return np.nan
+        if isinstance(val, str) and "," in val:
+            try:
+                parts = [float(v.strip()) for v in val.split(",")]
+                return sum(parts) / len(parts)
+            except ValueError:
+                return np.nan
+        try:
+            return float(val)
+        except (ValueError, TypeError):
+            return np.nan
+
+    for df, col, name in [(df_dhfus, "dHfus", "dHfus"), (df_tm, "Tm", "Tm")]:
+        n_multi = df[col].apply(lambda v: isinstance(v, str) and "," in v).sum()
+        if n_multi > 0:
+            print(f"Found {n_multi} {name} rows with comma-separated multi-value strings — averaging them")
+        df[col] = df[col].apply(parse_target)
+
+    #SUBSAMPLE Tm FOR TRACTABLE TRAINING TIME (SAME REASONING AS THE Tm BASELINE)
+    if len(df_tm) > tm_sample_size:
+        df_tm = df_tm.sample(n=tm_sample_size, random_state=seed).reset_index(drop=True)
+        print(f"Subsampled Tm dataset to {tm_sample_size} molecules")
+
+    #OUTER MERGE — KEEPS EVERY MOLECULE FROM EITHER DATASET, NaN WHERE A PROPERTY IS MISSING
+    df_pooled = pd.merge(df_dhfus, df_tm, on=smiles_column, how="outer")
+    print(f"Pooled dataset: {len(df_pooled)} total molecules "
+          f"({df_pooled['dHfus'].notna().sum()} with dHfus, {df_pooled['Tm'].notna().sum()} with Tm, "
+          f"{(df_pooled['dHfus'].notna() & df_pooled['Tm'].notna()).sum()} with both)")
+
+    #DROP ROWS MISSING BOTH TARGETS (NO USABLE LABEL AT ALL) AND INVALID/UNSANITIZABLE SMILES
+    df_pooled = df_pooled.dropna(subset=["dHfus", "Tm"], how="all").reset_index(drop=True)
+
+    def sanitize_smiles(smi):
+        mol = Chem.MolFromSmiles(smi)
+        if mol is None:
+            return None
+        try:
+            Chem.RemoveStereochemistry(mol)
+            return Chem.MolToSmiles(mol)
+        except Exception:
+            return None
+
+    df_pooled[smiles_column] = df_pooled[smiles_column].apply(sanitize_smiles)
+    df_pooled = df_pooled.dropna(subset=[smiles_column]).reset_index(drop=True)
+
+    print(f"After cleaning: {len(df_pooled)} molecules remain")
+
+    smis = df_pooled[smiles_column].values
+    ys = df_pooled[["Tm", "dHfus"]].values   #NaN ENTRIES PRESERVED — CHEMPROP HANDLES THESE NATIVELY
+    all_data = [data.MoleculeDatapoint.from_smi(smi, y) for smi, y in zip(smis, ys)]
+    mols = [d.mol for d in all_data]
+    return df_pooled, all_data, mols
+
+def predict_external_set(checkpoint_path, smiles_list, y_true_list, dropout=0.4, run_name="external"):
+    #EVALUATES A SAVED CHECKPOINT ON A COMPLETELY EXTERNAL DATASET (E.G. OOD TEST SET) —
+    #REBUILDS THE MATCHING MODEL ARCHITECTURE, LOADS THE SAVED WEIGHTS, THEN PREDICTS ON NEW DATA
+    featurizer = featurizers.SimpleMoleculeMolGraphFeaturizer()
+
+    external_data = [data.MoleculeDatapoint.from_smi(smi, [y]) for smi, y in zip(smiles_list, y_true_list)]
+    external_dset = data.MoleculeDataset(external_data, featurizer)
+    external_loader = data.build_dataloader(external_dset, num_workers=num_workers, shuffle=False)
+
+    #REBUILD ARCHITECTURE MATCHING THE ORIGINAL TRAINING CONFIG — SCALER GETS OVERWRITTEN BY THE CHECKPOINT LOAD
+    mp = nn.BondMessagePassing(dropout=dropout)
+    agg = nn.MeanAggregation()
+    dummy_transform = nn.UnscaleTransform(mean=np.array([0.0]), scale=np.array([1.0]))   #PLACEHOLDER, OVERWRITTEN BY CHECKPOINT
+    ffn = nn.RegressionFFN(output_transform=dummy_transform, dropout=dropout)
+    mpnn = models.MPNN(mp, agg, ffn, True, [nn.metrics.RMSE(), nn.metrics.MAE()])
+
+    checkpoint = torch.load(checkpoint_path, weights_only=False, map_location="cpu")
+    mpnn.load_state_dict(checkpoint["state_dict"])
+
+    trainer = pl.Trainer(accelerator="auto", devices=1, logger=False, enable_progress_bar=False)
+    with torch.inference_mode():
+        preds = trainer.predict(mpnn, external_loader)
+    y_pred = torch.cat([p if torch.is_tensor(p) else p[0] for p in preds]).numpy().flatten()
+
+    y_true = np.array(y_true_list)
+    abs_error = np.abs(y_pred - y_true)
+    rel_error = abs_error / np.abs(y_true) * 100
+
+    return pd.DataFrame({
+        "run_name": run_name, "smiles": smiles_list, "y_true": y_true, "y_pred": y_pred,
+        "abs_error": abs_error, "rel_error_pct": rel_error,
+    })
+
+#THIS FUNCTION IS USED TO EVALUATE JOBACK PREDICTIONS
+def joback_predict_dHfus(smi):
+    #RETURNS JOBACK'S PREDICTED DHFUS IN KCAL/MOL, OR None IF THE MOLECULE HAS UNASSIGNABLE GROUPS
+    try:
+        j = Joback(smi)
+        hfus_jmol = j.Hfus(j.counts)
+        if hfus_jmol is None:
+            return None
+        return hfus_jmol / 4184  #J/mol -> kcal/mol
+    except Exception:
+        return None
+
+
+def build_and_finetune_mpnn(pretrained_ckpt_path, train_data, val_data, test_data, metric_list=None,
+                             max_epochs=50, run_name="run", dropout=0.4, checkpoint_root="checkpoints"):
+    featurizer = featurizers.SimpleMoleculeMolGraphFeaturizer()
+    train_dset = data.MoleculeDataset(train_data[0], featurizer)
+    scaler = train_dset.normalize_targets()   #FITTED TO REAL dHfus DATA, NOT JOBACK'S DISTRIBUTION
+    val_dset = data.MoleculeDataset(val_data[0], featurizer)
+    val_dset.normalize_targets(scaler)
+    test_dset = data.MoleculeDataset(test_data[0], featurizer)
+
+    train_loader = data.build_dataloader(train_dset, num_workers=num_workers)
+    val_loader = data.build_dataloader(val_dset, num_workers=num_workers, shuffle=False)
+    test_loader = data.build_dataloader(test_dset, num_workers=num_workers, shuffle=False)
+
+    mp = nn.BondMessagePassing(dropout=dropout)
+    agg = nn.MeanAggregation()
+    output_transform = nn.UnscaleTransform.from_standard_scaler(scaler)   #CORRECT, REAL-DATA SCALER
+    ffn = nn.RegressionFFN(output_transform=output_transform, dropout=dropout)
+    if metric_list is None:
+        metric_list = [nn.metrics.RMSE(), nn.metrics.MAE()]
+    mpnn = models.MPNN(mp, agg, ffn, True, metric_list)
+
+    #LOAD PRETRAINED WEIGHTS, EXCLUDING output_transform — THAT BUFFER MUST STAY FITTED TO THE REAL DATA'S SCALE
+    pretrained_ckpt = torch.load(pretrained_ckpt_path, weights_only=False, map_location="cpu")
+    pretrained_state = {k: v for k, v in pretrained_ckpt["state_dict"].items() if "output_transform" not in k}
+    mpnn.load_state_dict(pretrained_state, strict=False)
+
+    early_stopping = EarlyStopping(monitor="val_loss", mode="min", patience=10)
+    checkpointing = ModelCheckpoint(
+        dirpath=f"{checkpoint_root}/{run_name}", filename="best-{epoch}-{val_loss:.3f}",
+        monitor="val_loss", mode="min", save_top_k=1,
+    )
+    trainer = pl.Trainer(max_epochs=max_epochs, callbacks=[checkpointing, early_stopping],
+                          enable_progress_bar=True, accelerator="auto", devices=1)
+    trainer.fit(mpnn, train_loader, val_loader)
+
+    best_ckpt_path = checkpointing.best_model_path
+    checkpoint = torch.load(best_ckpt_path, weights_only=False, map_location="cpu")
+    mpnn.load_state_dict(checkpoint["state_dict"])
+    test_results = trainer.test(mpnn, test_loader)
+
+    train_eval_dset = data.MoleculeDataset(train_data[0], featurizer)
+    train_eval_loader = data.build_dataloader(train_eval_dset, num_workers=num_workers, shuffle=False)
+
+    return {
+        "mpnn": mpnn, "trainer": trainer, "scaler": scaler, "test_results": test_results,
+        "test_dset": test_dset, "test_loader": test_loader,
+        "train_dset": train_eval_dset, "train_loader": train_eval_loader, "best_ckpt_path": best_ckpt_path,
+    }
+
+
+
