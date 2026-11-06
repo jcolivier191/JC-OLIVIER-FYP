@@ -25,9 +25,10 @@ directed message-passing neural network (D-MPNN, via ChemProp v2) on experimenta
 - Chemistry-motivated sub-questions: molecular weight, hydrogen-bonding capacity,
   and conformational flexibility, each compared directly against Joback's
   known limitations in these regimes
-- Multi-task learning (joint Tm + ΔHfus prediction), tested both with strict
-  molecule-level overlap and with full dataset pooling using native
-  missing-value handling
+- Multi-task learning (joint Tm + ΔHfus prediction) with a pooled dataset and native
+  missing-value handling. An overlap-only variant (training only on molecules that
+  have both labels) is implemented in `run_multitask.py` but was not used in the
+  thesis, because only 92 molecules have both values in the 10 000-molecule Tm subsample
 - Out-of-distribution generalisation to a pharma-specific external dataset
   (Wyttenbach et al. 2020), benchmarked against Joback and COSMOquick
 - Hybridisation of the physical (Joback) and data-driven (D-MPNN) approaches via
@@ -40,13 +41,13 @@ directed message-passing neural network (D-MPNN, via ChemProp v2) on experimenta
 ├── run_baseline.py                # Locked baseline models (ΔHfus or Tm), 10 seeds
 ├── run_factorial.py               # Dropout x training-loss sensitivity runs (3 seeds)
 ├── run_mw_subsets.py              # Small-MW / large-MW subset training vs full baseline
-├── run_multitask.py               # Joint Tm + ΔHfus models (pooled and overlap-only)
+├── run_multitask.py               # Joint Tm + ΔHfus model (pooled; overlap-only mode not used in the thesis)
 ├── run_hybrid.py                  # Joback-pretrain + fine-tune hybrid, 10 seeds
 ├── run_ood.py                     # Baseline checkpoints tested on the Wyttenbach market drugs
 ├── 01_data_validation.ipynb       # Data cleaning and sanity checks
 ├── 02_sensitivity_analysis.ipynb  # Split type, training metric, dropout
 ├── 04_subquestions_dHfus.ipynb    # MW subsets, H-bonding, rotatable bonds
-├── 05_multitask.ipynb             # Joint Tm + ΔHfus prediction (overlap-only and pooled)
+├── 05_multitask.ipynb             # Joint Tm + ΔHfus prediction (pooled; overlap-only not used in the report)
 ├── 06_ood_wyttenback.ipynb        # Out-of-distribution test on Wyttenbach et al. market drugs
 ├── 07_report_figures.ipynb        # Figures used in the report
 ├── 08_results_dHfus.ipynb         # Result plots and diagnostics: ΔHfus baseline
@@ -83,7 +84,7 @@ expect a `RAW DATA/` folder next to them containing:
 |---|---|
 | `dHfus_clean.csv` | Cleaned ΔHfus data (columns `smiles`, `dHfus [kcal/mol]`) |
 | `Tm_clean.csv` | Cleaned Tm data (columns `smiles`, `Tm[K]`) |
-| `Tm_clean_full.csv` | Optional: the full cleaned Tm set, used by the overlap multitask experiment |
+| `Tm_clean_full.csv` | Optional. The full cleaned Tm set. Only used by the overlap-only multitask mode, which is not part of the thesis results |
 | `wyttenbach_market_drugs.csv` | The 90 market drugs (columns `smiles`, `Tm_K`, and `dHf_kcalmol` or `dHf_kJmol`) |
 
 `01_data_validation.ipynb` documents how the clean files are produced from the
@@ -120,7 +121,7 @@ Run everything from the repository folder so the relative paths resolve
    ```
 3. **Independent experiments:**
    ```bash
-   python run_multitask.py    # pooled and overlap-only multitask models
+   python run_multitask.py    # pooled multitask model (the overlap-only mode is skipped unless Tm_clean_full.csv is present)
    python run_factorial.py    # dropout x loss sensitivity runs
    ```
 4. **Notebooks.** Open them in numerical order. They load the CSVs, checkpoints and
@@ -147,3 +148,4 @@ analysis (`run_factorial.py`, `02_sensitivity_analysis.ipynb`).
 ## Status
 
 All experiments in the thesis are implemented and run. Final-year project, 2026.
+
