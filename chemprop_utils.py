@@ -1,29 +1,28 @@
-##THIS SCRIPT CONTAINS COMMON FUNCTIONS AND DEFINTIONS USED ACCROSS SUBSEQUENT CHEMPROP IMPLEMENTATION SCRIPTS##
+##THIS SCRIPT CONTAINS COMMON FUNCTIONS AND DEFINITIONS USED ACROSS SUBSEQUENT CHEMPROP IMPLEMENTATION SCRIPTS##
 
 #IMPORTING OF ESSENTIAL LIBRARIES#
 from pathlib import Path                                                   #LIBRARY FOR HANDLING FILE PATHS
-import torch                                                               #LIBRARY FOR TENSOR CALCULATIONS AND CHEMPROP NN FRAMWORK
+import torch                                                               #LIBRARY FOR TENSOR CALCULATIONS AND CHEMPROP NN FRAMEWORK
 import numpy as np                                                         #LIBRARY FOR NUMERICAL ARRAY COMPUTATIONS
 import pandas as pd                                                        #LIBRARY FOR DATA TABLE MANIPULATIONS
 from lightning import pytorch as pl                                        #LIBRARY FOR NN ITERATIVE CALCULATIONS
-from lightning.pytorch.callbacks import ModelCheckpoint, EarlyStopping     #LIBRARY FOR TRAINING LOSS EVALAUTION AND STOPPING CRITERIA
+from lightning.pytorch.callbacks import ModelCheckpoint, EarlyStopping     #LIBRARY FOR TRAINING LOSS EVALUATION AND STOPPING CRITERIA
 from chemprop import data, featurizers, models, nn                         #LIBRARY FOR CHEMPROP ITSELF
 from rdkit import Chem                                                     #LIBRARY FOR CHEMICAL STRUCTURE MANIPULATION 
-from thermo.group_contribution import Joback      
+from thermo.group_contribution import Joback                                  #LIBRARY FOR JOBACK GROUP CONTRIBUTION PREDICTIONS
 
-num_workers = 0                                                            #THE NUMBER OF WORKERS USED FOR DATA LOADING AS A BACKGROUD PROCESS. INCREASING WORKER NUMBER CAN INCREASE PROCESSING SPEED, BUT MAY BE UNSTABLE IN SOME INSTANCES. GIVEN THE SMALL SIZE OF TEH DATASET, ZERO WORKERS IS MOST APPROPRIATE.
+num_workers = 0                                                            #THE NUMBER OF WORKERS USED FOR DATA LOADING AS A BACKGROUND PROCESS. INCREASING WORKER NUMBER CAN INCREASE PROCESSING SPEED, BUT MAY BE UNSTABLE IN SOME INSTANCES. GIVEN THE SMALL SIZE OF THE DATASET, ZERO WORKERS IS MOST APPROPRIATE.
                                                                             
-#DEFINITION OF DATA SCREENING AND LOADING FUNCTION. THE FUNCTION TAKE THE PATH TO THE .CSV FILE CONTAINING DATA, AND THE NAME OF THE TARGET PROPERTY COLUMN AND SMILES COLUMN AS INPUTS.
+#DEFINITION OF DATA SCREENING AND LOADING FUNCTION. THE FUNCTION TAKES THE PATH TO THE .CSV FILE CONTAINING DATA, AND THE NAME OF THE TARGET PROPERTY COLUMN AND SMILES COLUMN AS INPUTS.
 #NOTE: THE FUNCTION RETURNS DF, ALL_DATA AND MOLS. 
-#DF IS A CLEANED PANDAS DATAFRAME WITH THE SAME STRCUTURE AS THE RAW DATAFRAME, BUT WITH EMPTY ROWS REMOVED.
+#DF IS A CLEANED PANDAS DATAFRAME WITH THE SAME STRUCTURE AS THE RAW DATAFRAME, BUT WITH EMPTY ROWS REMOVED.
 # ALL_DATA IS A "TRAINING READY" LIST OF CHEMPROP MOLECULEDATAPOINTS. IT ONLY CONTAINS SMILES AND PAIRED TARGET PROPERTY VALUES.
 # MOLS IS A LIST OF RDKIT MOLECULE OBJECTS OBTAINED FROM SMILES. IT IS USED FOR DATA SPLITTING.                                                                
 def load_and_clean_data(input_path, smiles_column, target_columns):
     df = pd.read_csv(input_path)
     n_before = len(df)
-    #HANDLE TARGET VALUES STORED AS COMMA-SEPARATED STRINGS (E.G. "396.15, 396.15, 396.15, 396.15") —
-    #SOME ROWS APPEAR TO CONTAIN MULTIPLE REPEATED/DUPLICATE MEASUREMENTS AS A SINGLE STRING RATHER THAN
-    #A SINGLE CONSENSUS VALUE. TAKES THE MEAN OF ALL COMMA-SEPARATED VALUES IN SUCH CASES.
+    #SOME TARGET VALUES ARE STORED AS COMMA-SEPARATED STRINGS (E.G. "396.15, 396.15, 396.15, 396.15"), I.E. REPEATED MEASUREMENTS IN ONE CELL.
+    #THE MEAN OF THE VALUES IN SUCH A CELL IS USED AS THE TARGET VALUE.
     def parse_target(val):
         if pd.isna(val):
             return np.nan
@@ -41,7 +40,7 @@ def load_and_clean_data(input_path, smiles_column, target_columns):
     for col in target_columns:
         n_multi_value = df[col].apply(lambda v: isinstance(v, str) and "," in v).sum()
         if n_multi_value > 0:
-            print(f"Found {n_multi_value} rows in '{col}' with comma-separated multi-value strings — averaging them")
+            print(f"Found {n_multi_value} rows in '{col}' with comma-separated multi-value strings, averaging them")
         df[col] = df[col].apply(parse_target)
 
     df = df.dropna(subset=target_columns + [smiles_column]).reset_index(drop=True)
@@ -51,7 +50,7 @@ def load_and_clean_data(input_path, smiles_column, target_columns):
         if mol is None:
             return None
         try:
-            Chem.RemoveStereochemistry(mol)   #STRIPS ALL STEREO BOND/ATOM FLAGS — PREVENTS RDKIT CRASHES DURING LATER SCAFFOLD CANONICALIZATION ON CORRUPTED STEREO DATA
+            Chem.RemoveStereochemistry(mol)   #STRIPS ALL STEREO BOND/ATOM FLAGS. THIS PREVENTS RDKIT CRASHES IN THE LATER SCAFFOLD SPLIT ON CORRUPTED STEREO DATA
             return Chem.MolToSmiles(mol)       #RE-CANONICALIZES THE NOW STEREO-FREE MOLECULE BACK TO A CLEAN SMILES STRING
         except Exception:
             return None
@@ -85,7 +84,7 @@ def build_splits(all_data, mols, split_types=("scaffold_balanced", "random"), si
     return splits                                                                                               #RETURNS THE SPLIT ITSELF
 
 
-#DEFINITION OF K-FOLD CROSS VALIDATION FUNCTION. THE FUNCTION TAKES ALL_DATA AND A SPECIFIED NUMBER OF FOLDS AS INPUT. 
+#DEFINITION OF K-FOLD CROSS VALIDATION FUNCTION. NOT USED IN THE FINAL RESULTS (REPLACED BY REPEATED RANDOM SEEDS). KEPT FOR REFERENCE. THE FUNCTION TAKES ALL_DATA AND A SPECIFIED NUMBER OF FOLDS AS INPUT.
 def make_kfold_splits(all_data, k, seed=0, val_fraction=0.1):       #THE VALIDATION FRACTION OF 0.1 MEANS THAT AFTER THE TESTING SPLIT IS REMOVED FROM THE DATA SET, 10% PER OF THE REMAINDER IS USED FOR VALIDATION
     from sklearn.model_selection import KFold                       #IMPORTING THE K-FOLD LIBRARY FROM SCIKIT-LEARN LIBRARY
     kf = KFold(n_splits=k, shuffle=True, random_state=seed)         #CREATES A KFOLD OBJECT BASED ON A SPECCIFIED NUMBER OF K SPLITS, WITH SHUFFLING AND A RANDOM SEED FIXED TO ZERO FOR REPRODUCIBILITY
@@ -109,15 +108,15 @@ def make_kfold_splits(all_data, k, seed=0, val_fraction=0.1):       #THE VALIDAT
 
 #DEFINITION OF MPNN TRAINING FUNCTION ITSELF. THE FUNCTION TAKES TRAIN, VALIDATION AND TESTING DATA AS INPUTS, AND RUNS FOR A MAXIMUM OF 50 EPOCHS.
 def build_and_train_mpnn(train_data, val_data, test_data, metric_list=None, max_epochs=50,
-                          run_name="run", dropout=0.0, checkpoint_root="checkpoints"):          #THE METRIC LIST AND DROPOUT ARE CONFIGURABLE BUT DEFAULT TO NONE AND 0.0
+                          run_name="run", dropout=0.0, checkpoint_root="checkpoints", criterion=None):          #THE METRIC LIST AND DROPOUT ARE CONFIGURABLE BUT DEFAULT TO NONE AND 0.0
     featurizer = featurizers.SimpleMoleculeMolGraphFeaturizer()                                 #CREATES OBJECT THAT GENEERATES A VECTOR REPRESENTATION OF EACH ATOM AND BOND IN A MOELCULE BASED ON SMILES
 
     train_dset = data.MoleculeDataset(train_data[0], featurizer)                                #CREATES A STRUCTURE THAT COMBINES THE FEATURIZER AND THE TRAINING DATA ITSELF SO THAT TENSORS CAN BE GENERATED FOR EACH MOLECULE IN THE DATASET
     scaler = train_dset.normalize_targets()                                                     #NORMALIZATION OF TARGET PROPERTY VALUES TO A MEAN OF 0 AND STANDARD DEVIATION OF 1. 
 
-    #NOTE: A SEPARATE, UNSCALED COPY OF THE TRAIN DATA IS BUILT HERE SPECIFICALLY FOR LATER EVALUATION —
-    #TRAIN_DSET ITSELF STAYS SCALED (REQUIRED FOR TRAINING), SO REUSING IT DIRECTLY FOR PREDICTION COMPARISON
-    #WOULD REPEAT THE SAME UNIT-MISMATCH BUG THAT WAS FIXED FOR THE TEST SET EARLIER
+    #NOTE: A SEPARATE, UNSCALED COPY OF THE TRAIN DATA IS BUILT HERE SPECIFICALLY FOR LATER EVALUATION.
+    #TRAIN_DSET ITSELF STAYS SCALED (REQUIRED FOR TRAINING), SO IT CANNOT BE REUSED DIRECTLY TO COMPARE PREDICTIONS WITH THE TRUE (UNSCALED) VALUES.
+    
     train_eval_dset = data.MoleculeDataset(train_data[0], featurizer)
     train_eval_loader = data.build_dataloader(train_eval_dset, num_workers=num_workers, shuffle=False)
 
@@ -127,7 +126,6 @@ def build_and_train_mpnn(train_data, val_data, test_data, metric_list=None, max_
     val_dset.normalize_targets(scaler)
 
     test_dset = data.MoleculeDataset(test_data[0], featurizer)                                  #THE TEST SET IS ALSO SIMILARLY WRAPPED, BUT IS LEFT UNSCALED BECAUSE THE MODEL PREDICTIONS ARE UNSCALED BECAUSE EVALUATION AND SHOULD THEREFORE BE COMPARED TO THE UNSCALED TESTING DATA VALUES
-    #test_dset.normalize_targets(scaler)                 
 
     train_loader = data.build_dataloader(train_dset, num_workers=num_workers)                   #WRAPS THE APPROPROATELY SCALED AND NORMALIZED DATA (TRAINING, TESTING, VALIDATION) INTO A DATALOADER
     val_loader = data.build_dataloader(val_dset, num_workers=num_workers, shuffle=False)
@@ -141,12 +139,12 @@ def build_and_train_mpnn(train_data, val_data, test_data, metric_list=None, max_
 
     #STAGE 3: FEEDFORWARD NEURAL NETWORK (USES MOLECULAR FEATURE VECTOR TO PREDICT TARGET PROPERTY VALUES)
     output_transform = nn.UnscaleTransform.from_standard_scaler(scaler)                         #USED TO UNSCALE THE MODEL OUTPUTS FOR EVALUATION PURPOSES
-    ffn = nn.RegressionFFN(output_transform=output_transform, dropout=dropout)                  #FEEDFORWARD NEURAL NETWORK ITSELF. USES SPECFIED DROPOUT
+    ffn = nn.RegressionFFN(output_transform=output_transform, dropout=dropout, criterion=criterion)                  #FEEDFORWARD NEURAL NETWORK ITSELF. USES SPECFIED DROPOUT
     if metric_list is None:
         metric_list = [nn.metrics.RMSE(), nn.metrics.MAE()]                                     #THE SPECIFIED OR DEAULT ERROR METRIC IS INCORPORATED
     mpnn = models.MPNN(mp, agg, ffn, True, metric_list)                                         #WRAPS ALL STAGES INTO ONE FUNCTION. "TRUE" SPECIFIES THE USE OF BATCH_NORM
 
-    #WATCHES THE VALIDATION LOSS FOR EVERY EPOCH, WITH A MINIMUM SPECIEFIED AS OPTIMAL. IF THE LOSS DOES NOT DECREASE FOR 10 CONSECUTIVE EPOCHS, TRAINING IS STOPPED, EVEN IF THE MAXIMUM SPECIFIED EPOCHS HAS NOT BEEN REACHED
+    #WATCHES THE VALIDATION LOSS FOR EVERY EPOCH, WITH A MINIMUM SPECIFIED AS OPTIMAL. IF THE LOSS DOES NOT DECREASE FOR 10 CONSECUTIVE EPOCHS, TRAINING IS STOPPED, EVEN IF THE MAXIMUM SPECIFIED EPOCHS HAS NOT BEEN REACHED
     early_stopping = EarlyStopping(monitor="val_loss", mode="min", patience=10)
     checkpointing = ModelCheckpoint(                                                            #WATCHES THE VALIDATION LOSS FOR EVERY EPOCH AND SAVES THE MODEL WEIGHTS THAT HAVE RESULTED IN THE LOWEST ERROR UP TO THAT POINT
         dirpath=f"{checkpoint_root}/{run_name}",
@@ -157,7 +155,6 @@ def build_and_train_mpnn(train_data, val_data, test_data, metric_list=None, max_
         max_epochs=max_epochs,
         callbacks=[checkpointing, early_stopping],
         enable_progress_bar=True, accelerator="auto", devices=1,                               #CLUTTER CAN BE REMOVED FROM RUNS BY CHANGING THE PROGRESS BAR AND LOGGER DISPLAY SETTINGS
-        #logger=False
     )
     trainer.fit(mpnn, train_loader, val_loader)                                                 #USES THE TRAINING AND VALIDATION DATA LOADERS AND NEURAL NETWORK TO ITERATE THROUGH EPOCHS
     #NOTE: THIS IS WHERE THE EVALUATION LOSS MONITORED BY EARLY STOPPING AND CHECKPOINTING IS UPDATED
@@ -167,11 +164,12 @@ def build_and_train_mpnn(train_data, val_data, test_data, metric_list=None, max_
     mpnn.load_state_dict(checkpoint["state_dict"])                                              #OVERWRITES THE CURRENT WEIGHTS WITH THE BEST WEIGHTS
 
     test_results = trainer.test(mpnn, test_loader)                                              #MODEL TESTING BASED ON THE TEST DATA AND BEST WEIGHT BASED NEURAL NETWORK
-
+    val_results = trainer.validate(mpnn, val_loader, verbose=False)            #VALIDATION METRICS OF THE BEST WEIGHTS, USED TO CHOOSE THE FINAL CONFIGURATION
     return {
     "mpnn": mpnn, "trainer": trainer, "scaler": scaler,
     "test_results": test_results, "test_dset": test_dset, "test_loader": test_loader,
     "train_dset": train_eval_dset, "train_loader": train_eval_loader,
+    "val_results": val_results,
     "best_ckpt_path": best_ckpt_path,
 }
 
@@ -192,15 +190,15 @@ def predict_on_set(result, dset_key, loader_key, run_name=""):    #GENERALIZED V
     })
 
 
-def predict_test_set(result, run_name=""):    #KEPT FOR BACKWARD COMPATIBILITY — THIN WRAPPER AROUND predict_on_set
+def predict_test_set(result, run_name=""):    #KEPT SO EARLIER SCRIPTS STILL WORK. WRAPS predict_on_set FOR THE TEST SET
     return predict_on_set(result, "test_dset", "test_loader", run_name)     #RETURNS PREDICTIONS, PAIRED MOLECULES (SMILES) AND TRUE VALUES IN A DATAFRAME FOR LATER DISPLAY
 
 
 
 #MULTI-TASK TRAINING FUNCTION. THIS IS A MODIFIED VERSION OF THE SINGLE-TASK TRAINING FUNCTION ABOVE, BUT WITH MULTI-TASK CAPABILITIES. IT TAKES A LIST OF TASK NAMES AS INPUT AND BUILDS A MULTI-TASK NEURAL NETWORK WITH ONE OUTPUT HEAD PER TASK.
 def build_and_train_multitask_mpnn(train_data, val_data, test_data, task_names, metric_list=None,
-                                    max_epochs=50, run_name="run", dropout=0.0, checkpoint_root="checkpoints"):
-    #MULTI-TASK VERSION OF build_and_train_mpnn — TRAINS ONE MODEL TO JOINTLY PREDICT MULTIPLE PROPERTIES
+                                    max_epochs=50, run_name="run", dropout=0.0, checkpoint_root="checkpoints", criterion=None):
+    #MULTI-TASK VERSION OF build_and_train_mpnn. TRAINS ONE MODEL TO PREDICT MULTIPLE PROPERTIES
     #(HERE: Tm AND dHfus) FROM A SHARED MOLECULAR REPRESENTATION, RATHER THAN ONE MODEL PER PROPERTY
     n_tasks = len(task_names)
     featurizer = featurizers.SimpleMoleculeMolGraphFeaturizer()
@@ -211,7 +209,7 @@ def build_and_train_multitask_mpnn(train_data, val_data, test_data, task_names, 
     val_dset = data.MoleculeDataset(val_data[0], featurizer)
     val_dset.normalize_targets(scaler)
 
-    test_dset = data.MoleculeDataset(test_data[0], featurizer)   #LEFT UNSCALED — SAME REASONING AS SINGLE-TASK VERSION
+    test_dset = data.MoleculeDataset(test_data[0], featurizer)   #LEFT UNSCALED, SAME REASONING AS SINGLE-TASK VERSION
 
     train_loader = data.build_dataloader(train_dset, num_workers=num_workers)
     val_loader = data.build_dataloader(val_dset, num_workers=num_workers, shuffle=False)
@@ -220,7 +218,7 @@ def build_and_train_multitask_mpnn(train_data, val_data, test_data, task_names, 
     mp = nn.BondMessagePassing(dropout=dropout)
     agg = nn.MeanAggregation()
     output_transform = nn.UnscaleTransform.from_standard_scaler(scaler)
-    ffn = nn.RegressionFFN(n_tasks=n_tasks, output_transform=output_transform, dropout=dropout)   #n_tasks=2 IS THE KEY CHANGE — ONE OUTPUT HEAD PER PROPERTY
+    ffn = nn.RegressionFFN(n_tasks=n_tasks, output_transform=output_transform, dropout=dropout, criterion=criterion)   #n_tasks=2 GIVES ONE OUTPUT HEAD PER PROPERTY
     if metric_list is None:
         metric_list = [nn.metrics.RMSE(), nn.metrics.MAE()]
     mpnn = models.MPNN(mp, agg, ffn, True, metric_list)
@@ -252,7 +250,7 @@ def build_and_train_multitask_mpnn(train_data, val_data, test_data, task_names, 
 
 
 def predict_multitask(result, run_name=""):
-    #RETURNS PER-TASK PREDICTIONS FROM A MULTI-TASK MODEL, AS A DICT OF DATAFRAMES KEYED BY TASK NAME
+    #RETURNS PER-TASK PREDICTIONS FROM A MULTI-TASK MODEL AS A DICTIONARY OF DATAFRAMES, ONE PER TASK NAME
     with torch.inference_mode():
         preds = result["trainer"].predict(result["mpnn"], result["test_loader"])
     y_pred_all = torch.cat([p if torch.is_tensor(p) else p[0] for p in preds]).numpy()   #SHAPE (n, n_tasks)
@@ -297,7 +295,7 @@ def load_and_pool_multitask_data(dhfus_path, tm_path, smiles_column,
     for df, col, name in [(df_dhfus, "dHfus", "dHfus"), (df_tm, "Tm", "Tm")]:
         n_multi = df[col].apply(lambda v: isinstance(v, str) and "," in v).sum()
         if n_multi > 0:
-            print(f"Found {n_multi} {name} rows with comma-separated multi-value strings — averaging them")
+            print(f"Found {n_multi} {name} rows with comma-separated multi-value strings, averaging them")
         df[col] = df[col].apply(parse_target)
 
     #SUBSAMPLE Tm FOR TRACTABLE TRAINING TIME (SAME REASONING AS THE Tm BASELINE)
@@ -305,7 +303,7 @@ def load_and_pool_multitask_data(dhfus_path, tm_path, smiles_column,
         df_tm = df_tm.sample(n=tm_sample_size, random_state=seed).reset_index(drop=True)
         print(f"Subsampled Tm dataset to {tm_sample_size} molecules")
 
-    #OUTER MERGE — KEEPS EVERY MOLECULE FROM EITHER DATASET, NaN WHERE A PROPERTY IS MISSING
+    #OUTER MERGE KEEPS EVERY MOLECULE FROM EITHER DATASET, NaN WHERE A PROPERTY IS MISSING
     df_pooled = pd.merge(df_dhfus, df_tm, on=smiles_column, how="outer")
     print(f"Pooled dataset: {len(df_pooled)} total molecules "
           f"({df_pooled['dHfus'].notna().sum()} with dHfus, {df_pooled['Tm'].notna().sum()} with Tm, "
@@ -330,21 +328,21 @@ def load_and_pool_multitask_data(dhfus_path, tm_path, smiles_column,
     print(f"After cleaning: {len(df_pooled)} molecules remain")
 
     smis = df_pooled[smiles_column].values
-    ys = df_pooled[["Tm", "dHfus"]].values   #NaN ENTRIES PRESERVED — CHEMPROP HANDLES THESE NATIVELY
+    ys = df_pooled[["Tm", "dHfus"]].values   #NaN ENTRIES ARE KEPT. CHEMPROP HANDLES THESE NATIVELY
     all_data = [data.MoleculeDatapoint.from_smi(smi, y) for smi, y in zip(smis, ys)]
     mols = [d.mol for d in all_data]
     return df_pooled, all_data, mols
 
 def predict_external_set(checkpoint_path, smiles_list, y_true_list, dropout=0.4, run_name="external"):
-    #EVALUATES A SAVED CHECKPOINT ON A COMPLETELY EXTERNAL DATASET (E.G. OOD TEST SET) —
-    #REBUILDS THE MATCHING MODEL ARCHITECTURE, LOADS THE SAVED WEIGHTS, THEN PREDICTS ON NEW DATA
+    #EVALUATES A SAVED CHECKPOINT ON A COMPLETELY EXTERNAL DATASET (E.G. OOD TEST SET).
+    #THE MATCHING MODEL ARCHITECTURE IS REBUILT, THE SAVED WEIGHTS ARE LOADED, THEN THE NEW DATA IS PREDICTED. DROPOUT IS INACTIVE DURING PREDICTION, SO THE DEFAULT VALUE DOES NOT AFFECT THE RESULTS
     featurizer = featurizers.SimpleMoleculeMolGraphFeaturizer()
 
     external_data = [data.MoleculeDatapoint.from_smi(smi, [y]) for smi, y in zip(smiles_list, y_true_list)]
     external_dset = data.MoleculeDataset(external_data, featurizer)
     external_loader = data.build_dataloader(external_dset, num_workers=num_workers, shuffle=False)
 
-    #REBUILD ARCHITECTURE MATCHING THE ORIGINAL TRAINING CONFIG — SCALER GETS OVERWRITTEN BY THE CHECKPOINT LOAD
+    #REBUILD ARCHITECTURE MATCHING THE ORIGINAL TRAINING CONFIG. THE SCALER GETS OVERWRITTEN BY THE CHECKPOINT LOAD
     mp = nn.BondMessagePassing(dropout=dropout)
     agg = nn.MeanAggregation()
     dummy_transform = nn.UnscaleTransform(mean=np.array([0.0]), scale=np.array([1.0]))   #PLACEHOLDER, OVERWRITTEN BY CHECKPOINT
@@ -382,7 +380,7 @@ def joback_predict_dHfus(smi):
 
 
 def build_and_finetune_mpnn(pretrained_ckpt_path, train_data, val_data, test_data, metric_list=None,
-                             max_epochs=50, run_name="run", dropout=0.4, checkpoint_root="checkpoints"):
+                             max_epochs=50, run_name="run", dropout=0.4, checkpoint_root="checkpoints", criterion=None):
     featurizer = featurizers.SimpleMoleculeMolGraphFeaturizer()
     train_dset = data.MoleculeDataset(train_data[0], featurizer)
     scaler = train_dset.normalize_targets()   #FITTED TO REAL dHfus DATA, NOT JOBACK'S DISTRIBUTION
@@ -396,13 +394,13 @@ def build_and_finetune_mpnn(pretrained_ckpt_path, train_data, val_data, test_dat
 
     mp = nn.BondMessagePassing(dropout=dropout)
     agg = nn.MeanAggregation()
-    output_transform = nn.UnscaleTransform.from_standard_scaler(scaler)   #CORRECT, REAL-DATA SCALER
-    ffn = nn.RegressionFFN(output_transform=output_transform, dropout=dropout)
+    output_transform = nn.UnscaleTransform.from_standard_scaler(scaler)   #SCALER FITTED TO THE REAL dHfus DATA
+    ffn = nn.RegressionFFN(output_transform=output_transform, dropout=dropout, criterion=criterion)
     if metric_list is None:
         metric_list = [nn.metrics.RMSE(), nn.metrics.MAE()]
     mpnn = models.MPNN(mp, agg, ffn, True, metric_list)
 
-    #LOAD PRETRAINED WEIGHTS, EXCLUDING output_transform — THAT BUFFER MUST STAY FITTED TO THE REAL DATA'S SCALE
+    #LOAD PRETRAINED WEIGHTS, EXCLUDING output_transform. THAT BUFFER MUST STAY FITTED TO THE REAL DATA'S SCALE
     pretrained_ckpt = torch.load(pretrained_ckpt_path, weights_only=False, map_location="cpu")
     pretrained_state = {k: v for k, v in pretrained_ckpt["state_dict"].items() if "output_transform" not in k}
     mpnn.load_state_dict(pretrained_state, strict=False)
@@ -430,5 +428,10 @@ def build_and_finetune_mpnn(pretrained_ckpt_path, train_data, val_data, test_dat
         "train_dset": train_eval_dset, "train_loader": train_eval_loader, "best_ckpt_path": best_ckpt_path,
     }
 
-
-
+def joback_predict_Tm(smi):
+    #RETURNS JOBACK'S PREDICTED Tm IN K, OR None IF GROUPS CANNOT BE ASSIGNED
+    try:
+        j = Joback(smi)
+        return j.Tm(j.counts)
+    except Exception:
+        return None

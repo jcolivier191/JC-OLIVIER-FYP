@@ -1,6 +1,9 @@
 checkpoints/
-  *.csv
-  __pycache__/
-  *.pyc
-  .ipynb_checkpoints/
-  
+lightning_logs/
+RAW DATA/
+*.csv
+*.pkl
+plots_*.png
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
